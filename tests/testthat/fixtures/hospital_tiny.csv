@@ -1,0 +1,6 @@
+encounter_id,patient_nbr,race,gender,age,admission_type_id,discharge_disposition_id,admission_source_id,time_in_hospital,num_lab_procedures,num_procedures,num_medications,number_outpatient,number_emergency,number_inpatient,number_diagnoses,max_glu_serum,A1Cresult,change,diabetesMed,insulin
+300,11,Caucasian,Female,[70-80),1,1,7,5,40,1,15,0,0,1,9,None,>8,Ch,Yes,Up
+100,11,Caucasian,Female,[70-80),1,1,7,3,35,0,12,0,0,0,7,None,None,No,Yes,Steady
+200,22,?,Male,[50-60),3,6,1,2,20,2,8,1,0,0,5,>300,Norm,No,No,No
+400,33,AfricanAmerican,Unknown/Invalid,[60-70),2,1,7,4,50,0,10,0,1,0,6,,,No,Yes,No
+500,44,Hispanic,Male,[0-10),1,11,7,14,70,3,25,0,0,2,9,Norm,>7,Ch,Yes,Down
