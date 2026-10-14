@@ -1,0 +1,4 @@
+"cluster","age_years","bmi","physical_unhealthy_days","mental_unhealthy_days","n_train","diabetes_rate_train"
+"1",68.08,27.87,1.4,1.23,67094,"18.4%"
+"2",35.97,28.55,1.51,5.91,48373,"5.4%"
+"3",60.6,30.19,25.64,12.43,17368,"29.0%"

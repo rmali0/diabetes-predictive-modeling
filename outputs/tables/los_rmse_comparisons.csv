@@ -1,0 +1,3 @@
+"comparison","diff","low","high"
+"Random forest minus Linear regression",-0.08199,-0.095,-0.06829
+"Random forest minus Random forest, no cluster",-0.00049,-0.00423,0.00318

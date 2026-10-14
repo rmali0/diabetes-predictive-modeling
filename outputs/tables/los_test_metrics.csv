@@ -1,0 +1,8 @@
+"model","rmse","mae","r2"
+"Random forest",2.2867,1.726,0.3946
+"Random forest, no cluster",2.2872,1.7262,0.3943
+"Regression tree",2.3673,1.7906,0.3511
+"Lasso",2.3686,1.8042,0.3504
+"Linear regression",2.3687,1.8042,0.3504
+"Ridge",2.3695,1.8055,0.35
+"Training mean (no model)",2.9389,2.3107,0

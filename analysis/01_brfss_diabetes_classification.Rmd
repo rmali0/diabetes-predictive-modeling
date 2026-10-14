@@ -243,7 +243,7 @@ knitr::kable(transform(cv_table, cv_auc = fmt_num(cv_auc)), row.names = FALSE,
 The random forest uses `ranger` with `r rf_trees` trees; the no-cluster forest
 reuses the tuned settings of the main forest and is trained on the same rows
 without the cluster feature. The selected classification tree (cp =
-`r models$tree$bestTune$cp`) has `r fmt_int(tree_leaves)` leaves.
+`r format(models$tree$bestTune$cp, scientific = FALSE)`) has `r fmt_int(tree_leaves)` leaves.
 `r if (tree_leaves > 30) "At this sample size a deep tree discriminates better than a shallow one, but it is no longer a short rule set someone could read, which was the reason for including a tree." else ""`
 Model fitting took `r fmt_num(fit_minutes, 1)` minutes on `r threads` threads.
 

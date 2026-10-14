@@ -1,0 +1,3 @@
+"comparison","auc_difference","p_value"
+"Random forest, no cluster vs Logistic regression",0.001856,0.155889
+"Random forest vs Random forest, no cluster",-0.000164,0.726466

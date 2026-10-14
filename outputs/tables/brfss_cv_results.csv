@@ -1,0 +1,5 @@
+"model","cv_auc","tuning"
+"Logistic regression",0.8016,"none"
+"Penalized logistic",0.8018,"alpha=0.5, lambda=0.000518"
+"Classification tree",0.7701,"cp=5e-05"
+"Random forest",0.8043,"mtry=3, splitrule=gini, min.node.size=25"

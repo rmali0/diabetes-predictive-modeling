@@ -1,0 +1,4 @@
+"cluster","age_mid","num_lab_procedures","num_procedures","num_medications","number_outpatient","number_emergency","number_inpatient","number_diagnoses","n_train","mean_los_train"
+"1",72.18,44.67,0.65,14.67,0.4,0.15,0.27,8.42,26607,4.36
+"2",57.08,35.74,0.91,11.33,0.14,0.06,0.07,5.07,18567,3.12
+"3",64.57,50.68,3.96,24.64,0.21,0.07,0.13,7.99,12039,5.92

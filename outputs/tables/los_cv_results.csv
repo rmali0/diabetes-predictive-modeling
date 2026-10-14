@@ -1,0 +1,6 @@
+"model","cv_rmse","cv_mae","tuning"
+"Linear regression",2.3872,1.8049,"none"
+"Ridge",2.3883,1.8072,"alpha=0, lambda=0.0886"
+"Lasso",2.3872,1.8049,"alpha=1, lambda=0.00113"
+"Regression tree",2.3866,1.7929,"cp=3e-04"
+"Random forest",2.2883,1.7187,"mtry=6, splitrule=variance, min.node.size=20"
