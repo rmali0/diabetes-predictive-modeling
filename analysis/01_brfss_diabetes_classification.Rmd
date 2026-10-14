@@ -1,0 +1,406 @@
+---
+title: "Classifying diagnosed diabetes from BRFSS 2024 survey responses"
+author: "Richard Mali"
+output:
+  github_document:
+    html_preview: false
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, fig.align = "center")
+source("../R/utils.R")
+for (f in list.files(repo_path("R"), pattern = "[.]R$", full.names = TRUE)) source(f)
+suppressPackageStartupMessages({
+  library(caret)
+  library(survey)
+})
+started <- Sys.time()
+threads <- n_threads()
+seed <- 5330
+```
+
+This notebook fits five classifiers for self-reported diagnosed diabetes using
+2024 BRFSS predictors, then evaluates them once on a held-out test set. All
+preprocessing that estimates anything from data (median imputation, scaling,
+the k-means risk-profile cluster) is fit on the training rows only.
+
+## 1. Data and cohort
+
+```{r load}
+raw <- data.table::fread(repo_path("data", "brfss2024_extract_slim.csv.gz"), data.table = FALSE)
+state_names <- c(`1` = "Alabama", `2` = "Alaska", `4` = "Arizona", `5` = "Arkansas",
+                 `6` = "California", `8` = "Colorado", `9` = "Connecticut", `10` = "Delaware",
+                 `11` = "District of Columbia", `12` = "Florida", `13` = "Georgia",
+                 `15` = "Hawaii", `16` = "Idaho", `17` = "Illinois", `18` = "Indiana",
+                 `19` = "Iowa", `20` = "Kansas", `21` = "Kentucky", `22` = "Louisiana",
+                 `23` = "Maine", `24` = "Maryland")
+stopifnot(all(as.character(unique(raw[["_STATE"]])) %in% names(state_names)))
+
+analytic <- prepare_brfss(raw)
+rf_trees <- 200
+if (quick_run()) {
+  set.seed(seed)
+  analytic <- analytic[sample(nrow(analytic), 8000), ]
+  rf_trees <- 50
+}
+excluded <- table(factor(raw$DIABETE4, levels = c(2, 7, 9)), useNA = "ifany")
+n_raw <- nrow(raw)
+n_analytic <- nrow(analytic)
+prevalence <- mean(analytic$diabetes == "Yes")
+
+weight_by_state <- aggregate(`_LLCPWT` ~ `_STATE`, data = raw, FUN = sum)
+md_weight <- weight_by_state$`_LLCPWT`[weight_by_state$`_STATE` == 24] / 1e6
+```
+
+The file is the course-provided extract of the 2024 BRFSS combined landline and
+cell phone data. It is **not the national file**: it holds
+`r fmt_int(n_raw)` records from `r length(unique(raw[["_STATE"]]))` jurisdictions
+(state FIPS 1 to 24, `r paste(state_names, collapse = ", ")`). Results describe
+respondents in these jurisdictions only.
+
+The extract appears to be the first part of the national file, cut off partway
+through Maryland: Maryland's final weights sum to only `r fmt_num(md_weight, 2)`
+million, far below its adult population, while the other jurisdictions look
+complete. Maryland respondents are kept for modeling but excluded from the
+survey-weighted estimates below.
+
+The outcome is DIABETE4 = 1 ("ever told you have diabetes") versus 3 (no) or 4
+(no, prediabetes or borderline). I excluded gestational-only diabetes
+(code 2, n = `r fmt_int(excluded[["2"]])`), don't know (7, n = `r fmt_int(excluded[["7"]])`),
+refused (9, n = `r fmt_int(excluded[["9"]])`) and blanks. The analytic cohort has
+`r fmt_int(n_analytic)` respondents and an unweighted prevalence of
+`r fmt_pct(prevalence)`.
+
+Coding checks against the 2024 codebook, applied in `R/recode_brfss.R`:
+
+- PHYSHLTH and MENTHLTH: 88 means zero days; 77 and 99 are set to missing.
+- `_BMI5` has two implied decimals, so BMI = `_BMI5` / 100; blanks are missing.
+- CHECKUP1 = 8 means "never had a routine checkup". The course version treated it
+  as missing; here it is its own level.
+- Calculated variables use 9 for don't know or missing; those, and 7/9 on the
+  yes/no items, become an explicit `Missing` level.
+- `_TOTINDA`, `_RFHLTH` and `_MICHD` are dropped because they are recodes of
+  EXERANY2, GENHLTH and CVDINFR4/CVDCRHD4, which are already in the model. The
+  agreement check below confirms the overlap.
+
+```{r redundancy}
+redundancy <- data.frame(
+  derived = c("_TOTINDA", "_RFHLTH", "_MICHD"),
+  source = c("EXERANY2", "GENHLTH", "CVDINFR4 or CVDCRHD4"),
+  agreement = c(
+    mean((raw$EXERANY2 %in% 1) == (raw$`_TOTINDA` %in% 1)),
+    mean((raw$GENHLTH %in% 1:3) == (raw$`_RFHLTH` %in% 1)),
+    mean((raw$CVDINFR4 %in% 1 | raw$CVDCRHD4 %in% 1) == (raw$`_MICHD` %in% 1))
+  )
+)
+redundancy$agreement <- fmt_pct(redundancy$agreement, 3)
+knitr::kable(redundancy, col.names = c("Dropped variable", "Derived from", "Rows that agree"))
+```
+
+## 2. Survey-weighted prevalence (context only)
+
+The models below are unweighted predictive models: they learn from the sample as
+drawn and are evaluated on held-out respondents. To put the sample prevalence in
+context, I estimated weighted prevalence with the BRFSS design (strata `_STSTR`,
+final weight `_LLCPWT`, one respondent per PSU) over the 20 complete jurisdictions.
+
+```{r survey}
+options(survey.lonely.psu = "adjust")
+svy_data <- data.frame(state = raw[["_STATE"]], strata = raw[["_STSTR"]], psu = raw[["_PSU"]],
+                       weight = raw[["_LLCPWT"]], diabete4 = raw$DIABETE4,
+                       age65 = as.numeric(raw[["_AGE80"]] >= 65))
+svy_data <- svy_data[svy_data$diabete4 %in% 1:4, ]
+svy_data$cdc_definition <- as.numeric(svy_data$diabete4 == 1)
+svy_data$model_definition <- ifelse(svy_data$diabete4 == 2, NA, svy_data$cdc_definition)
+# In BRFSS each respondent is their own PSU (_PSU repeats the record number
+# within a state). With one respondent per PSU, ids = ~1 gives the same
+# linearized variance as ids = ~psu and runs in seconds instead of minutes.
+stopifnot(!anyDuplicated(svy_data[c("state", "psu")]))
+design <- svydesign(ids = ~1, strata = ~strata, weights = ~weight, data = svy_data)
+design_complete <- subset(design, state != 24)
+
+estimate <- function(formula, dsn) {
+  est <- svymean(formula, dsn, na.rm = TRUE)
+  ci <- confint(est)
+  c(estimate = unname(coef(est)), low = ci[1], high = ci[2])
+}
+prev_cdc <- estimate(~cdc_definition, design_complete)
+prev_model <- estimate(~model_definition, design_complete)
+unweighted_complete <- mean(analytic$diabetes[analytic$state_fips != 24] == "Yes")
+age65_weighted <- estimate(~age65, design_complete)[["estimate"]]
+age65_unweighted <- mean(svy_data$age65[svy_data$state != 24])
+
+prev_table <- data.frame(
+  definition = c("Diagnosed diabetes, DIABETE4 = 1 vs 2/3/4",
+                 "Model outcome, DIABETE4 = 1 vs 3/4"),
+  weighted = c(prev_cdc["estimate"], prev_model["estimate"]),
+  low = c(prev_cdc["low"], prev_model["low"]),
+  high = c(prev_cdc["high"], prev_model["high"])
+)
+write_table(prev_table, "brfss_weighted_prevalence")
+knitr::kable(transform(prev_table, weighted = fmt_pct(weighted), low = fmt_pct(low),
+                       high = fmt_pct(high)),
+             col.names = c("Definition", "Weighted prevalence", "95% CI low", "95% CI high"))
+
+by_state <- svyby(~model_definition, ~state, design, svymean, na.rm = TRUE)
+by_state <- data.frame(state = state_names[as.character(by_state$state)],
+                       weighted_prevalence = by_state$model_definition,
+                       se = by_state$se,
+                       note = ifelse(by_state$state == 24, "incomplete sample", ""))
+write_table(by_state, "brfss_weighted_prevalence_by_state")
+```
+
+Weighted prevalence of the model outcome is `r fmt_pct(prev_model["estimate"])`
+(95% CI `r fmt_pct(prev_model["low"])` to `r fmt_pct(prev_model["high"])`), against
+an unweighted `r fmt_pct(unweighted_complete)` in the same jurisdictions. Much of
+the gap is age: `r fmt_pct(age65_unweighted)` of these respondents are 65 or older,
+versus a weighted `r fmt_pct(age65_weighted)`. Predicted probabilities from the
+unweighted models therefore reflect the sample, not the adult population.
+State estimates are in `outputs/tables/brfss_weighted_prevalence_by_state.csv`.
+
+## 3. Train/test split and train-only preprocessing
+
+```{r split}
+set.seed(seed)
+train_idx <- createDataPartition(analytic$diabetes, p = 0.80, list = FALSE)[, 1]
+train_raw <- analytic[train_idx, ]
+test_raw <- analytic[-train_idx, ]
+
+prep <- fit_preprocessor(train_raw, impute_vars = brfss_numeric_vars,
+                         cluster_vars = brfss_numeric_vars,
+                         cluster_name = "risk_profile_cluster", k = 3, nstart = 20, seed = seed)
+train <- apply_preprocessor(prep, train_raw)
+test <- apply_preprocessor(prep, test_raw)
+
+base_predictors <- c(brfss_numeric_vars, names(brfss_factor_spec))
+predictors <- c(base_predictors, "risk_profile_cluster")
+y_train <- as.integer(train$diabetes == "Yes")
+y_test <- as.integer(test$diabetes == "Yes")
+missing_share <- vapply(train_raw[brfss_numeric_vars], function(x) mean(is.na(x)), numeric(1))
+```
+
+I split 80/20, stratified on the outcome (train n = `r fmt_int(nrow(train))`,
+test n = `r fmt_int(nrow(test))`), before any imputation or clustering. Training
+medians fill missing numeric values (BMI is missing for
+`r fmt_pct(missing_share[["bmi"]])` of training rows). The k-means risk-profile
+cluster (k = 3, 20 starts) is fit on standardized age, BMI and unhealthy days in
+the training set; test respondents are assigned to the nearest training center.
+
+```{r cluster-profile}
+profile <- cluster_profile(prep, train)
+profile$diabetes_rate_train <- fmt_pct(tapply(y_train, train$risk_profile_cluster, mean)[profile$cluster])
+write_table(profile, "brfss_cluster_profile")
+knitr::kable(profile, col.names = c("Cluster", "Age", "BMI", "Phys. days", "Ment. days",
+                                    "Train n", "Diabetes rate"))
+```
+
+### PCA check
+
+```{r pca}
+pca_x <- model.matrix(reformulate(base_predictors), data = train)[, -1]
+pca_x <- pca_x[, apply(pca_x, 2, sd) > 0]
+pca <- prcomp(pca_x, center = TRUE, scale. = TRUE)
+pca_cum <- cumsum(pca$sdev^2) / sum(pca$sdev^2)
+pca_90 <- which(pca_cum >= 0.90)[1]
+```
+
+On the dummy-coded training predictors, `r pca_90` of `r length(pca_cum)`
+principal components are needed to explain 90% of the variance, so PCA would
+compress little and cost interpretability. I kept the original variables.
+
+## 4. Models and cross-validation
+
+All models share the same five stratified folds of the training set and are
+tuned on cross-validated AUC.
+
+```{r fit}
+folds <- cv_folds(train$diabetes, k = 5, seed = seed)
+fit_start <- Sys.time()
+models <- classification_models(train, "diabetes", predictors, folds, threads,
+                               rf_trees = rf_trees)
+models$forest_no_cluster <- fit_ranger_fixed(train, "diabetes", base_predictors,
+                                             tune = models$forest$bestTune,
+                                             threads = threads, trees = rf_trees)
+fit_minutes <- as.numeric(difftime(Sys.time(), fit_start, units = "mins"))
+tree_leaves <- sum(models$tree$finalModel$frame$var == "<leaf>")
+
+labels <- c(logistic = "Logistic regression", penalized = "Penalized logistic",
+            tree = "Classification tree", forest = "Random forest",
+            forest_no_cluster = "Random forest, no cluster")
+colors <- model_colors(unname(labels))
+
+cv_table <- data.frame(
+  model = labels[c("logistic", "penalized", "tree", "forest")],
+  cv_auc = vapply(models[c("logistic", "penalized", "tree", "forest")], cv_summary,
+                  numeric(1), metric = "ROC"),
+  tuning = vapply(models[c("logistic", "penalized", "tree", "forest")], tune_label, character(1))
+)
+write_table(cv_table, "brfss_cv_results")
+knitr::kable(transform(cv_table, cv_auc = fmt_num(cv_auc)), row.names = FALSE,
+             col.names = c("Model", "5-fold CV AUC", "Selected tuning"))
+```
+
+The random forest uses `ranger` with `r rf_trees` trees; the no-cluster forest
+reuses the tuned settings of the main forest and is trained on the same rows
+without the cluster feature. The selected classification tree (cp =
+`r models$tree$bestTune$cp`) has `r fmt_int(tree_leaves)` leaves.
+`r if (tree_leaves > 30) "At this sample size a deep tree discriminates better than a shallow one, but it is no longer a short rule set someone could read, which was the reason for including a tree." else ""`
+Model fitting took `r fmt_num(fit_minutes, 1)` minutes on `r threads` threads.
+
+## 5. Held-out test performance
+
+The decision threshold for each model is the highest cut-off that reaches 80%
+sensitivity in that model's **out-of-fold training predictions**. I targeted
+sensitivity because, for a screening use, a missed case (someone who never gets
+an HbA1c test) costs more than an extra test. Choosing the threshold on training
+data keeps the test set untouched until final scoring.
+
+```{r test-metrics}
+test_prob <- lapply(models, predict_prob, newdata = test)
+oof <- lapply(models[c("logistic", "penalized", "tree", "forest")], oof_prob)
+
+# The no-cluster forest was not cross-validated, so its threshold comes from its
+# own out-of-bag training predictions, which are also out-of-sample.
+oob_no_cluster <- models$forest_no_cluster$finalModel$predictions[, "Yes"]
+thresholds <- c(vapply(oof, threshold_for_sensitivity, numeric(1), y01 = y_train, target = 0.80),
+                forest_no_cluster = threshold_for_sensitivity(oob_no_cluster, y_train, 0.80))
+
+test_table <- do.call(rbind, lapply(names(models), function(m) {
+  p <- test_prob[[m]]
+  cbind(model = labels[[m]], auc_with_ci(p, y_test),
+        average_precision = average_precision(p, y_test),
+        brier = brier_score(p, y_test),
+        confusion_metrics(p, y_test, thresholds[[m]]))
+}))
+test_table <- test_table[order(-test_table$auc), ]
+write_table(test_table, "brfss_test_metrics")
+
+show <- with(test_table, data.frame(
+  Model = model,
+  `AUC (95% CI)` = sprintf("%.3f (%.3f to %.3f)", auc, auc_low, auc_high),
+  `Avg. precision` = fmt_num(average_precision),
+  Brier = fmt_num(brier, 4),
+  Threshold = fmt_num(threshold),
+  Sensitivity = fmt_num(sensitivity), Specificity = fmt_num(specificity),
+  PPV = fmt_num(ppv), check.names = FALSE))
+knitr::kable(show, row.names = FALSE)
+
+brier_null <- brier_score(rep(mean(y_train), length(y_test)), y_test)
+
+roc_list <- lapply(test_prob, roc_object, y01 = y_test)
+best <- names(labels)[match(test_table$model[1], labels)]
+cmp_best <- pROC::roc.test(roc_list[[best]], roc_list$logistic, method = "delong", paired = TRUE)
+cmp_cluster <- pROC::roc.test(roc_list$forest, roc_list$forest_no_cluster, method = "delong",
+                              paired = TRUE)
+comparisons <- data.frame(
+  comparison = c(paste(labels[[best]], "vs Logistic regression"),
+                 "Random forest vs Random forest, no cluster"),
+  auc_difference = c(diff(rev(as.numeric(cmp_best$estimate))),
+                     diff(rev(as.numeric(cmp_cluster$estimate)))),
+  p_value = c(cmp_best$p.value, cmp_cluster$p.value)
+)
+write_table(comparisons, "brfss_auc_comparisons", digits = 6)
+```
+
+For reference, predicting the training prevalence for everyone gives a Brier
+score of `r fmt_num(brier_null, 4)` on this test set. The best Brier score,
+`r fmt_num(min(test_table$brier), 4)`, is a `r fmt_pct(1 - min(test_table$brier) / brier_null)`
+reduction from that baseline.
+
+Paired DeLong tests on the test set:
+
+```{r comparisons}
+knitr::kable(transform(comparisons, auc_difference = fmt_num(auc_difference, 4),
+                       p_value = format.pval(p_value, digits = 3, eps = 1e-4)),
+             col.names = c("Comparison", "AUC difference", "p value"))
+```
+
+```{r roc-figure}
+roc_df <- do.call(rbind, lapply(names(roc_list), function(m) {
+  r <- roc_list[[m]]
+  data.frame(model = labels[[m]], sensitivity = rev(r$sensitivities),
+             specificity = rev(r$specificities))
+}))
+auc_lookup <- setNames(sprintf("%s (AUC %.3f)", test_table$model, test_table$auc), test_table$model)
+roc_df$model <- factor(auc_lookup[as.character(roc_df$model)], levels = auc_lookup[unname(labels)])
+p_roc <- plot_roc(roc_df, setNames(colors, auc_lookup[names(colors)]),
+                  title = "ROC curves, held-out test set",
+                  subtitle = sprintf("BRFSS 2024, 21 jurisdictions, n = %s test respondents",
+                                     fmt_int(length(y_test))))
+save_figure(p_roc, "brfss_roc_curves", width = 7, height = 6.5)
+knitr::include_graphics(figure_link("brfss_roc_curves"))
+```
+
+```{r pr-figure}
+pr_df <- do.call(rbind, lapply(names(test_prob), function(m) {
+  cbind(model = labels[[m]], pr_curve(test_prob[[m]], y_test))
+}))
+pr_df <- pr_df[pr_df$recall > 0, ]  # precision is undefined before the first case
+pr_df$model <- factor(pr_df$model, levels = unname(labels))
+p_pr <- plot_pr(pr_df, colors, prevalence = mean(y_test),
+                title = "Precision-recall curves, held-out test set")
+save_figure(p_pr, "brfss_precision_recall", width = 7, height = 5.5)
+knitr::include_graphics(figure_link("brfss_precision_recall"))
+```
+
+With about one positive in seven, precision is the harder number. At the
+80%-sensitivity threshold the best model flags `r fmt_pct(test_table$flagged[1])`
+of test respondents, and `r fmt_pct(test_table$ppv[1])` of those flagged have
+diagnosed diabetes.
+
+```{r calibration-figure}
+cal_models <- c("logistic", "penalized", "tree", "forest")
+cal_df <- do.call(rbind, lapply(cal_models, function(m) {
+  cbind(model = labels[[m]], calibration_bins(test_prob[[m]], y_test, bins = 10))
+}))
+cal_df$model <- factor(cal_df$model, levels = unname(labels[cal_models]))
+write_table(cal_df, "brfss_calibration_deciles")
+p_cal <- plot_calibration(cal_df, colors[unname(labels[cal_models])],
+                          title = "Calibration, held-out test set")
+save_figure(p_cal, "brfss_calibration", width = 10, height = 3.6)
+knitr::include_graphics(figure_link("brfss_calibration"))
+```
+
+## 6. Which predictors matter
+
+Permutation importance is the drop in test AUC when one predictor is shuffled.
+It is computed the same way for the logistic model and the random forest, so the
+two can be compared on one scale.
+
+```{r importance}
+auc_metric <- function(y, p) as.numeric(pROC::auc(roc_object(p, y)))
+imp <- do.call(rbind, lapply(c("logistic", "forest"), function(m) {
+  pf <- function(d) predict_prob(models[[m]], d)
+  cbind(model = labels[[m]],
+        permutation_importance(pf, test, y_test, predictors, auc_metric, seed = seed))
+}))
+imp$model <- factor(imp$model, levels = unname(labels[c("logistic", "forest")]))
+write_table(imp, "brfss_permutation_importance", digits = 5)
+p_imp <- plot_importance(imp, colors[unname(labels[c("logistic", "forest")])],
+                         title = "Predictor importance for diagnosed diabetes",
+                         x_label = "Drop in test AUC when shuffled")
+save_figure(p_imp, "brfss_permutation_importance", width = 9, height = 5)
+knitr::include_graphics(figure_link("brfss_permutation_importance"))
+top_logistic <- head(imp$variable[imp$model == labels[["logistic"]]], 4)
+top_forest <- head(imp$variable[imp$model == labels[["forest"]]], 4)
+```
+
+## 7. Summary
+
+- Best test AUC: `r test_table$model[1]`, `r fmt_num(test_table$auc[1])`
+  (95% CI `r fmt_num(test_table$auc_low[1])` to `r fmt_num(test_table$auc_high[1])`).
+  Logistic regression reached `r fmt_num(test_table$auc[test_table$model == labels[["logistic"]]])`.
+- The k-means cluster changed random forest test AUC by
+  `r fmt_num(comparisons$auc_difference[2], 4)` (DeLong p = `r format.pval(comparisons$p_value[2], digits = 3, eps = 1e-4)`).
+- Top predictors by permutation importance: `r paste(top_logistic, collapse = ", ")`
+  (logistic) and `r paste(top_forest, collapse = ", ")` (random forest).
+- These are associations in cross-sectional survey data. A respondent who
+  already knows they have diabetes may report worse health or more checkups
+  because of the diagnosis, so the model describes who reports diabetes rather
+  than who will develop it.
+
+```{r runtime}
+runtime <- as.numeric(difftime(Sys.time(), started, units = "mins"))
+```
+
+Notebook runtime: `r fmt_num(runtime, 1)` minutes.

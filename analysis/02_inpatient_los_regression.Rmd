@@ -1,0 +1,282 @@
+---
+title: "Predicting inpatient length of stay for patients with diabetes"
+author: "Richard Mali"
+output:
+  github_document:
+    html_preview: false
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, fig.align = "center")
+source("../R/utils.R")
+for (f in list.files(repo_path("R"), pattern = "[.]R$", full.names = TRUE)) source(f)
+suppressPackageStartupMessages(library(caret))
+started <- Sys.time()
+threads <- n_threads()
+seed <- 5330
+```
+
+This notebook fits five regression models for `time_in_hospital` (days, 1 to 14)
+in the UCI Diabetes 130-US Hospitals data and evaluates them once on held-out
+patients. Rare-level lumping, median imputation, scaling and the k-means
+care-complexity cluster are all fit on training patients only.
+
+## 1. Data and cohort
+
+```{r load}
+raw <- data.table::fread(repo_path("data", "diabetic_data.csv.gz"), data.table = FALSE,
+                         na.strings = c("", "NA", "?"))
+n_encounters <- nrow(raw)
+n_patients <- length(unique(raw$patient_nbr))
+repeat_share <- mean(duplicated(raw$patient_nbr))
+
+n_invalid_gender <- sum(first_encounter_per_patient(raw)$gender %in% "Unknown/Invalid")
+analytic <- prepare_los(raw)
+rf_trees <- 200
+if (quick_run()) {
+  set.seed(seed)
+  analytic <- analytic[sample(nrow(analytic), 6000), ]
+  rf_trees <- 50
+}
+n_analytic <- nrow(analytic)
+```
+
+The raw file has `r fmt_int(n_encounters)` encounters from `r fmt_int(n_patients)`
+patients; `r fmt_pct(repeat_share)` of encounters are repeat visits by a patient
+already in the data. In the course version, encounters were split at random, so
+the same patient could appear in both training and test data. Repeat stays of one
+person share diagnoses, medications and care patterns, so that split rewards a
+model for recognizing patients rather than for generalizing to new ones, and it
+also makes CV folds within the training set leak in the same way.
+
+Here I keep each patient's first encounter (lowest `encounter_id`) and drop the
+`r n_invalid_gender`
+first encounters with gender recorded as Unknown/Invalid. The analytic cohort has
+`r fmt_int(n_analytic)` patients, one row each, so a random split is a split by
+patient. Mean length of stay is `r fmt_num(mean(analytic$time_in_hospital), 2)` days
+(median `r median(analytic$time_in_hospital)`).
+
+Coding notes (`R/recode_hospital.R`): `?` is missing; missing race is kept as a
+`Missing` level; age bands such as `[70-80)` become midpoints (75);
+`max_glu_serum` and `A1Cresult` of `None` mean the test was not done and become
+`Not_measured`; admission type, discharge disposition and admission source are
+ID codes treated as categories.
+
+## 2. Train/test split and train-only preprocessing
+
+```{r split}
+set.seed(seed)
+train_idx <- createDataPartition(analytic$time_in_hospital, p = 0.80, list = FALSE)[, 1]
+lumped <- lump_rare_levels(analytic[train_idx, ], analytic[-train_idx, ],
+                           vars = los_factor_vars, min_n = 30)
+prep <- fit_preprocessor(lumped$train, impute_vars = los_numeric_vars,
+                         cluster_vars = los_numeric_vars,
+                         cluster_name = "care_complexity_cluster", k = 3, nstart = 20,
+                         seed = seed)
+train <- apply_preprocessor(prep, lumped$train)
+test <- apply_preprocessor(prep, lumped$test)
+
+base_predictors <- c(los_numeric_vars, los_factor_vars)
+predictors <- c(base_predictors, "care_complexity_cluster")
+outcome <- "time_in_hospital"
+y_train <- train[[outcome]]
+y_test <- test[[outcome]]
+train_counts <- lapply(los_factor_vars, function(v) table(analytic[train_idx, v]))
+pooled_vars <- los_factor_vars[vapply(train_counts, function(t) any(t > 0 & t < 30), logical(1))]
+```
+
+The 80/20 split is stratified on length-of-stay quantiles (train n =
+`r fmt_int(nrow(train))`, test n = `r fmt_int(nrow(test))`). Category levels with
+fewer than 30 training patients are pooled into `Other` (this affected
+`r paste(pooled_vars, collapse = ", ")`), using training counts
+only. The care-complexity cluster (k = 3, 20 starts) is fit on standardized age
+and the seven utilization counts in the training set; test patients are assigned
+to the nearest training center.
+
+```{r cluster-profile}
+profile <- cluster_profile(prep, train)
+profile$mean_los_train <- round(tapply(y_train, train$care_complexity_cluster, mean)[profile$cluster], 2)
+write_table(profile, "los_cluster_profile")
+knitr::kable(profile, col.names = c("Cluster", "Age", "Labs", "Procedures", "Medications",
+                                    "Outpatient", "Emergency", "Inpatient", "Diagnoses",
+                                    "Train n", "Mean LOS"))
+```
+
+### PCA check
+
+```{r pca}
+pca_x <- model.matrix(reformulate(base_predictors), data = train)[, -1]
+pca_x <- pca_x[, apply(pca_x, 2, sd) > 0]
+pca <- prcomp(pca_x, center = TRUE, scale. = TRUE)
+pca_cum <- cumsum(pca$sdev^2) / sum(pca$sdev^2)
+pca_90 <- which(pca_cum >= 0.90)[1]
+```
+
+On the dummy-coded training predictors, `r pca_90` of `r length(pca_cum)`
+components are needed for 90% of the variance, so I kept the original variables.
+
+## 3. Models and cross-validation
+
+```{r fit}
+folds <- cv_folds(y_train, k = 5, seed = seed)
+fit_start <- Sys.time()
+models <- regression_models(train, outcome, predictors, folds, threads, rf_trees = rf_trees)
+models$forest_no_cluster <- fit_ranger_fixed(train, outcome, base_predictors,
+                                             tune = models$forest$bestTune, threads = threads,
+                                             trees = rf_trees, classification = FALSE)
+fit_minutes <- as.numeric(difftime(Sys.time(), fit_start, units = "mins"))
+tree_leaves <- sum(models$tree$finalModel$frame$var == "<leaf>")
+
+labels <- c(linear = "Linear regression", ridge = "Ridge", lasso = "Lasso",
+            tree = "Regression tree", forest = "Random forest",
+            forest_no_cluster = "Random forest, no cluster")
+colors <- model_colors(unname(labels[c("linear", "ridge", "lasso", "tree", "forest")]))
+cv_names <- c("linear", "ridge", "lasso", "tree", "forest")
+cv_table <- data.frame(
+  model = labels[cv_names],
+  cv_rmse = vapply(models[cv_names], cv_summary, numeric(1), metric = "RMSE"),
+  cv_mae = vapply(models[cv_names], cv_summary, numeric(1), metric = "MAE"),
+  tuning = vapply(models[cv_names], tune_label, character(1))
+)
+write_table(cv_table, "los_cv_results")
+knitr::kable(transform(cv_table, cv_rmse = fmt_num(cv_rmse), cv_mae = fmt_num(cv_mae)),
+             row.names = FALSE, col.names = c("Model", "5-fold CV RMSE", "5-fold CV MAE",
+                                              "Selected tuning"))
+```
+
+The forest uses `ranger` with `r rf_trees` trees; the no-cluster forest reuses
+its tuned settings without the cluster feature. The selected regression tree has
+`r fmt_int(tree_leaves)` leaves. Model fitting took `r fmt_num(fit_minutes, 1)`
+minutes on `r threads` threads.
+
+## 4. Held-out test performance
+
+```{r test-metrics}
+test_pred <- lapply(models, function(m) as.numeric(predict(m, newdata = test)))
+test_pred$null <- rep(mean(y_train), nrow(test))
+labels <- c(labels, null = "Training mean (no model)")
+
+test_table <- do.call(rbind, lapply(names(test_pred), function(m) {
+  cbind(model = labels[[m]], regression_metrics(y_test, test_pred[[m]]))
+}))
+test_table <- test_table[order(test_table$rmse), ]
+write_table(test_table, "los_test_metrics")
+knitr::kable(transform(test_table, rmse = fmt_num(rmse), mae = fmt_num(mae), r2 = fmt_num(r2)),
+             row.names = FALSE, col.names = c("Model", "Test RMSE (days)", "Test MAE (days)",
+                                              "Test R-squared"))
+
+best <- names(labels)[match(test_table$model[1], labels)]
+diff_best <- paired_rmse_diff(y_test, test_pred[[best]], test_pred$linear, seed = seed)
+diff_cluster <- paired_rmse_diff(y_test, test_pred$forest, test_pred$forest_no_cluster,
+                                 seed = seed)
+comparisons <- rbind(cbind(comparison = paste(labels[[best]], "minus Linear regression"), diff_best),
+                     cbind(comparison = "Random forest minus Random forest, no cluster",
+                           diff_cluster))
+write_table(comparisons, "los_rmse_comparisons", digits = 5)
+```
+
+R-squared is computed on the test set as 1 - SSE/SST around the test mean.
+Differences in test RMSE, with 95% paired bootstrap intervals (2,000 resamples of
+test patients):
+
+```{r comparisons}
+knitr::kable(transform(comparisons, diff = fmt_num(diff, 4), low = fmt_num(low, 4),
+                       high = fmt_num(high, 4)),
+             col.names = c("Comparison", "RMSE difference", "95% CI low", "95% CI high"))
+```
+
+```{r observed-predicted}
+show_models <- c("linear", "tree", "forest")
+op_df <- do.call(rbind, lapply(show_models, function(m) {
+  data.frame(model = labels[[m]], observed = y_test, predicted = test_pred[[m]])
+}))
+op_df$model <- factor(op_df$model, levels = unname(labels[show_models]))
+p_op <- plot_observed_vs_predicted(op_df, colors[unname(labels[show_models])],
+                                   title = "Predicted vs observed length of stay")
+save_figure(p_op, "los_observed_vs_predicted", width = 7, height = 7)
+knitr::include_graphics(figure_link("los_observed_vs_predicted"))
+```
+
+All models pull predictions toward the mean: short stays are over-predicted and
+long stays under-predicted. This is what an R-squared near
+`r fmt_num(test_table$r2[1], 2)` looks like in practice.
+
+### Residual diagnostics
+
+```{r residuals}
+res_models <- c("linear", "forest")
+res_df <- do.call(rbind, lapply(res_models, function(m) {
+  data.frame(model = labels[[m]], predicted = test_pred[[m]], residual = y_test - test_pred[[m]])
+}))
+res_df$model <- factor(res_df$model, levels = unname(labels[res_models]))
+p_res <- plot_residuals(res_df, colors[unname(labels[res_models])],
+                        title = "Residuals vs predicted length of stay")
+save_figure(p_res, "los_residuals", width = 9, height = 4.5)
+knitr::include_graphics(figure_link("los_residuals"))
+
+lin_resid <- y_test - test_pred$linear
+p_qq <- plot_qq(lin_resid, "Normal Q-Q plot, linear regression test residuals")
+save_figure(p_qq, "los_linear_qq", width = 5.5, height = 5)
+knitr::include_graphics(figure_link("los_linear_qq"))
+resid_skew <- mean((lin_resid - mean(lin_resid))^3) / sd(lin_resid)^3
+below_one <- mean(test_pred$linear < 1)
+```
+
+The diagonal stripes are there because the outcome is whole days. The linear
+model's residual smooth bends at both ends: it under-predicts patients it scores
+lowest and over-predicts those it scores highest, and `r fmt_pct(below_one)` of
+its test predictions are below one day, which is impossible for an inpatient
+stay. The forest's residuals stay centered across the range, which matches its
+lower test error. Residuals are also right-skewed (skewness
+`r fmt_num(resid_skew, 2)` for the linear model). RMSE and MAE remain valid
+accuracy summaries, but normal-theory standard errors for the linear model's
+coefficients would not be, so I compare models on test error rather than on
+coefficient p-values. A count model (Poisson or negative binomial) is a natural
+next step.
+
+## 5. Which predictors matter
+
+Permutation importance here is the increase in test RMSE when one predictor is
+shuffled.
+
+```{r importance}
+rmse_metric <- function(y, p) sqrt(mean((y - p)^2))
+imp_models <- c("linear", "forest")
+imp <- do.call(rbind, lapply(imp_models, function(m) {
+  pf <- function(d) as.numeric(predict(models[[m]], newdata = d))
+  cbind(model = labels[[m]],
+        permutation_importance(pf, test, y_test, predictors, rmse_metric,
+                               higher_is_better = FALSE, seed = seed))
+}))
+imp$model <- factor(imp$model, levels = unname(labels[imp_models]))
+write_table(imp, "los_permutation_importance", digits = 5)
+p_imp <- plot_importance(imp, colors[unname(labels[imp_models])],
+                         title = "Predictor importance for length of stay",
+                         x_label = "Increase in test RMSE when shuffled (days)")
+save_figure(p_imp, "los_permutation_importance", width = 9, height = 5)
+knitr::include_graphics(figure_link("los_permutation_importance"))
+top_linear <- head(imp$variable[imp$model == labels[["linear"]]], 4)
+top_forest <- head(imp$variable[imp$model == labels[["forest"]]], 4)
+```
+
+## 6. Summary
+
+- Lowest test RMSE: `r test_table$model[1]`, `r fmt_num(test_table$rmse[1])` days
+  (MAE `r fmt_num(test_table$mae[1])`, R-squared `r fmt_num(test_table$r2[1])`),
+  versus `r fmt_num(test_table$rmse[test_table$model == labels[["null"]]])` days for
+  predicting the training mean.
+- The care-complexity cluster changed random forest test RMSE by
+  `r fmt_num(diff_cluster$diff, 4)` days (95% CI `r fmt_num(diff_cluster$low, 4)` to
+  `r fmt_num(diff_cluster$high, 4)`).
+- Top predictors by permutation importance: `r paste(top_linear, collapse = ", ")`
+  (linear) and `r paste(top_forest, collapse = ", ")` (random forest).
+- Several predictors (number of lab tests, medications, procedures and diagnoses,
+  and discharge disposition) are only known during or at the end of the stay. The
+  models therefore describe what tracks with longer stays; they are not
+  admission-time forecasts.
+
+```{r runtime}
+runtime <- as.numeric(difftime(Sys.time(), started, units = "mins"))
+```
+
+Notebook runtime: `r fmt_num(runtime, 1)` minutes.
